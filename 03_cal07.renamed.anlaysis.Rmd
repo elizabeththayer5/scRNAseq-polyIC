@@ -1,0 +1,216 @@
+---
+title: "03_cal07_renamed.analysis"
+output: html_document
+---
+Analysis based primarily on the Sun and Vera et. al. 2020 paper with the code from https://github.com/BROOKELAB/SingleCell/tree/fa170e4c16f64670bada6ef56ae9cf1ffafb4786 and the Seurat database vignettes https://github.com/satijalab/seurat/blob/master/vignettes/pbmc3k_tutorial.Rmd  
+Preliminary analysis with regressing out the cell cycle markers that skew the clustering
+
+*This document can't be knit yet as it throws an error at line 156 and I need to figure out how to fix that
+
+```{r}
+# load required libraries
+library(Seurat)
+library(ggplot2)
+library(sctransform)
+library(dplyr)
+```
+
+Read in the .h5 file using Seurat function. Load in the count matrix as a Seurat object. 
+```{r}
+# read in Cal07 filtered data
+cal07_a549_counts <- Read10X_h5(
+        "/Users/ethayer/Google Drive/Grad School/Brooke Lab/Data/polyIC_scRNAseq/03_scRNAseq_h5/Cal07_aggr/filtered_feature_bc_matrix.h5",
+        use.names = TRUE, unique.features = TRUE)
+# load the data into Seurat for analysis
+a549 <- CreateSeuratObject(counts = cal07_a549_counts, min.cells = 4, 
+                           min.features = 400, project = "cal07_mock")
+```
+Organize the data into two levels based off of the barcode ids (in this case Cal07(1) or Mock(2)). 
+```{r}
+# split the rownames by -, then select only the second element 
+# (the number 1 (cal07) or 2 (mock))
+experiment_id <- factor(sapply(strsplit(rownames(a549@meta.data), "-"), 
+                               function(x) x[2]))
+# set the factor levels
+levels(experiment_id) <- c("Cal07", "Mock")
+
+# Add it back to the seurat object meta-data
+a549@meta.data$experiment_id <- experiment_id
+```
+
+
+Look at QC metrics of the data. 
+```{r}
+# Show QC metrics for the first/last 20 cells
+head(a549@meta.data, 20)
+tail(a549@meta.data, 20)
+summary(a549@meta.data$experiment_id)
+
+# Visualize QC metrics as a violin plot
+VlnPlot(a549, features = c("nFeature_RNA", "nCount_RNA"), ncol = 2)
+        
+# Look at the relationship between counts and features
+FeatureScatter(a549, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",
+               group.by =  "experiment_id")
+```
+
+Filtering based on QC. Low feature could mean this is a droplet. High count/feature indicates a doublet.
+```{r}
+# Subset to a new object based off of the QC data 
+a549_01 <- subset(a549, 
+                  subset = nFeature_RNA > 500 & nFeature_RNA < 8500 & nCount_RNA < 115000)
+
+expr <- FetchData(object = object, vars = var1)
+object[, which(x = expr > low & expr < high)]
+a549_01@meta.data
+# Do all the QC stuff again with the new object
+head(a549_01@meta.data, 20)
+# Visualize QC metrics as a violin plot
+VlnPlot(a549_01, features = c("nFeature_RNA", "nCount_RNA"), ncol = 2)
+# Look at the relationship between counts and features
+FeatureScatter(a549_01, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", 
+               group.by =  "experiment_id")
+
+```
+
+Loading in the cell cycle markers from Tirosh et. al., 2015 with Seurat. We can then assign cell cycle scores.
+```{r}
+# Loading in the markers
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+# Assign cell cycle scores based off of the imported cycle markers above
+a549_01 <- CellCycleScoring(
+        a549_01,
+        s.features = s.genes,
+        g2m.features = g2m.genes,
+        set.ident = TRUE)
+
+# view cell cycle scores and phase assignments
+head(a549_01[[]])
+```
+
+
+```{r}
+# different scaling method which allows you to specify variables contributing to the scaling/normalization of the data
+a549_01 <- SCTransform(
+        a549_01, method = "glmGamPoi",
+        vars.to.regress = c("S.Score", "G2M.Score"),
+        verbose = FALSE)
+```
+
+Looking at which dimensions contribute the most to the percentage of variance
+```{r}
+# PCA to find similar genes/cells for clustering
+a549_01 <- RunPCA(a549_01, verbose = FALSE)
+# Best explanation from https://github.com/satijalab/seurat/blob/master/vignettes/pbmc3k_tutorial.Rmd:
+# "‘Elbow plot’: a ranking of principle components based on the percentage of variance explained by each one"
+# I chose 15, as there is little drop off after that and it is best to be conservative when picking your dimensions to not leave anything out
+ElbowPlot(a549_01)
+```
+
+Performing dimensional reduction and clustering
+```{r}
+# making UMAP dimensional reduction
+a549_01 <- RunUMAP(a549_01, dims = 1:15, verbose = FALSE)
+a549_01 <- FindNeighbors(a549_01, dims = 1:15, verbose = FALSE)
+a549_01 <- FindClusters(a549_01, verbose = FALSE, resolution = 0.5)
+DimPlot(a549_01, label = TRUE) + NoLegend()
+```
+
+Want to make sure the cell cycle genes are regressed out
+```{r}
+# loop to plot each UMAP with colored cell cycle genes one by one
+for (x in g2m.genes[g2m.genes %in% VariableFeatures(a549)]) {
+    g <- FeaturePlot(a549_01, x, order = TRUE, pt.size = 1)  
+    print(g)
+}
+
+# UMAP color/clustering based on classification of cell cycle
+# making sure the cell cycle genes are widely distributed
+FeaturePlot(a549_01, "G2M.Score")
+```
+
+Identifying the most variable genes
+```{r}
+# identify features that are outliers on a 'mean variability plot'
+a549_01 <- FindVariableFeatures(a549_01, selection.method = "vst", nfeatures = 2000)
+
+# Identify the 25 most highly variable genes
+top25 <- head(VariableFeatures(a549_01), 15)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(a549_01)
+plot2 <- LabelPoints(plot = plot1, points = top25, repel = TRUE,
+                     max.overlaps = 20, xnudge = 0, ynudge = 0)
+plot2
+```
+
+Where in the clustering are the viral genes being expressed
+```{r}
+# where are the infected cells in the dimensional reduction
+segment_gene_names <- c("NS", "HA", "NA", "NP", "PB2", "PB1", "PA", "M")
+
+# loop to plot each UMAP with colored flu genes one by one
+for (x in segment_gene_names) {
+    g <- FeaturePlot(a549_01, x, order = TRUE, pt.size = 1)  
+    print(g)
+}
+```
+
+# Calculating the viral score
+
+Still needed to do: 
+- set cutoffs for each viral gene based off the first local minimum
+- see what % of the population is infected
+- look at IFN & ISG landscape
+
+Organizing to just look at  Cal07-exposed population (hopefully infected)
+```{r}
+# subetting to select only cells from the Cal07 population
+just_cal <- subset(x = a549_01, subset = experiment_id == "Cal07")
+just_cal
+```
+
+Setting cutoffs and quickly trying to look at genes... ending here for now
+```{r}
+# This will calculate the number of UMI that match flu segments in each cell
+# starting with the subset that only has the cal07 population
+flu_counts <- colSums(GetAssayData(just_cal, slot = "count")[segment_gene_names,])
+all_counts <- colSums(GetAssayData(just_cal, slot = "count"))
+# calculating the percentage of flu in population
+just_cal$flu_pct_count <- flu_counts / all_counts
+just_cal$log_flu_pct_count <- log10((just_cal$flu_pct_count * 100) + 1)
+
+# This will calculate the number of UMI that match flu segments in each cell 
+# this is the aggregated object
+flu_counts2 <- colSums(GetAssayData(a549_01, slot = "count")[segment_gene_names,])
+all_counts2 <- colSums(GetAssayData(a549_01, slot = "count"))
+
+a549_01$flu_pct_count2 <- flu_counts2 / all_counts2
+a549_01$log_flu_pct_count2 <- log10((a549_01$flu_pct_count2 * 100) + 1)
+
+# getting a density line from the subset data
+des.all <- density(just_cal$log_flu_pct_count)
+# finding first local minima and setting as the cutoff
+min.all <- des.all$x[which(diff(sign(diff(des.all$y)))==2)+1]
+min.all
+
+# density plot of aggregated data with the cutoff from subset
+qplot(x = a549_01$log_flu_pct_count2, geom = "density") + scale_y_sqrt() +
+        geom_vline(xintercept = min.all[1])
+
+FeaturePlot(a549_01, "log_flu_pct_count")
+
+a549_01$is_infected <- a549_01$log_flu_pct_count2 > min.all[1]
+FeaturePlot(a549_01, "is_infected")
+FeaturePlot(a549_01, "is_infected", split.by = "experiment_id", keep.scale = "all")
+FeaturePlot(a549_01, "SLFN5", split.by = "experiment_id", keep.scale = "all")
+
+VlnPlot(a549_01, "SLFN5", split.by = "is_infected", group.by = "experiment_id")
+grep("SLFN5", VariableFeatures(a549_01), value = TRUE)
+
+Idents(a549_01) <- a549_01$is_infected
+FindAllMarkers(a549_01)
+```
+
